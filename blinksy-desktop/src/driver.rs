@@ -191,6 +191,7 @@ impl Desktop<Dim1d, ()> {
         let stage = DesktopStageOptions {
             positions,
             receiver,
+            led_click_sender: None,
             config,
             is_window_closed: is_window_closed_2,
         };
@@ -260,6 +261,7 @@ impl Desktop<Dim2d, ()> {
         let stage = DesktopStageOptions {
             positions,
             receiver,
+            led_click_sender: None,
             config,
             is_window_closed: is_window_closed_2,
         };
@@ -329,6 +331,7 @@ impl Desktop<Dim3d, ()> {
         let stage = DesktopStageOptions {
             positions,
             receiver,
+            led_click_sender: None,
             config,
             is_window_closed: is_window_closed_2,
         };
@@ -378,6 +381,15 @@ where
         f(driver).await
     }
 
+    /// Registers a queue for LED click events.
+    ///
+    /// The handle is only borrowed during registration and can then be moved into
+    /// the control loop. Calling this again replaces the previously registered queue.
+    pub fn with_led_clicks(mut self, led_clicks: &DesktopLedClicks) -> Self {
+        self.stage.led_click_sender = Some(led_clicks.sender.clone());
+        self
+    }
+
     /// Registers a keycode to be treated as a button input.
     /// Take care not to conflict with the keys used for camera control (R,O) to avoid surprising behavior.
     pub fn with_button<D, I>(mut self, keycode: KeyCode, button: &DesktopButton<D, I>) -> Self
@@ -418,6 +430,36 @@ impl<Dim, Layout> DesktopDriver<Dim, Layout> {
         }
         self.sender.send(message)?;
         Ok(())
+    }
+}
+
+/// A non-blocking receiver for LED click events from the desktop simulator.
+///
+/// Create this handle before starting the simulator and register it with
+/// [`Desktop::with_led_clicks`], then move it into your control loop.
+pub struct DesktopLedClicks {
+    sender: Sender<usize>,
+    receiver: Receiver<usize>,
+}
+
+impl DesktopLedClicks {
+    /// Creates an empty LED click queue.
+    pub fn new() -> Self {
+        let (sender, receiver) = channel();
+        Self { sender, receiver }
+    }
+
+    /// Returns the next LED index clicked in the simulator, if one is pending.
+    ///
+    /// This method never blocks. Only successful primary-button LED picks emit events.
+    pub fn try_take(&mut self) -> Option<usize> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+impl Default for DesktopLedClicks {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1056,6 +1098,7 @@ impl Renderer {
 struct DesktopStageOptions {
     pub positions: Vec<Vec3>,
     pub receiver: Receiver<LedMessage>,
+    pub led_click_sender: Option<Sender<usize>>,
     pub config: DesktopConfig,
     pub is_window_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1069,6 +1112,7 @@ struct DesktopStage {
     brightness: f32,
     correction: ColorCorrection,
     receiver: Receiver<LedMessage>,
+    led_click_sender: Option<Sender<usize>>,
     camera: Camera,
     config: DesktopConfig,
     is_window_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1103,6 +1147,7 @@ impl DesktopStage {
         let DesktopStageOptions {
             positions,
             receiver,
+            led_click_sender,
             config,
             is_window_closed,
         } = options;
@@ -1136,6 +1181,7 @@ impl DesktopStage {
             brightness: 1.0,
             correction: ColorCorrection::default(),
             receiver,
+            led_click_sender,
             camera,
             config,
             is_window_closed,
@@ -1294,6 +1340,11 @@ impl EventHandler for DesktopStage {
             if !self.mouse_down {
                 // Only do picking when button is first pressed
                 self.led_picker.try_select_at(x, y, &self.camera);
+                if let Some(led_index) = self.led_picker.selected_led {
+                    if let Some(sender) = &self.led_click_sender {
+                        let _ = sender.send(led_index);
+                    }
+                }
             }
 
             self.mouse_down = true;
@@ -1335,6 +1386,49 @@ impl EventHandler for DesktopStage {
     fn quit_requested_event(&mut self) {
         self.is_window_closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    blinksy::layout1d!(TestStrip, 8);
+
+    #[test]
+    fn registered_click_queue_can_move_to_control_thread() {
+        let mut clicks = DesktopLedClicks::new();
+        let desktop = Desktop::new_1d::<TestStrip>().with_led_clicks(&clicks);
+        let sender = desktop.stage.led_click_sender.as_ref().unwrap();
+        assert_eq!(clicks.try_take(), None);
+        sender.send(2).unwrap();
+        sender.send(7).unwrap();
+
+        std::thread::spawn(move || {
+            assert_eq!(clicks.try_take(), Some(2));
+            assert_eq!(clicks.try_take(), Some(7));
+            assert_eq!(clicks.try_take(), None);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn click_registration_is_optional_and_replaceable() {
+        let desktop = Desktop::new_1d::<TestStrip>();
+        assert!(desktop.stage.led_click_sender.is_none());
+        let mut first = DesktopLedClicks::default();
+        let mut second = DesktopLedClicks::new();
+        let desktop = desktop.with_led_clicks(&first).with_led_clicks(&second);
+        desktop
+            .stage
+            .led_click_sender
+            .as_ref()
+            .unwrap()
+            .send(3)
+            .unwrap();
+        assert_eq!(first.try_take(), None);
+        assert_eq!(second.try_take(), Some(3));
     }
 }
 
